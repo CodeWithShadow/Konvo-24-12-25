@@ -341,11 +341,11 @@ a:focus-visible {
   overflow-y: auto;
   overflow-x: hidden;
   scroll-behavior: smooth;
-  padding-bottom: 8px; /* Reduced from 20px */
+  padding-bottom: 4px; /* Changed from 8px */
   overflow-anchor: none;
   contain: layout style;
   flex: 1;
-  min-height: 0; /* Important for flexbox scrolling */
+  min-height: 0;
 }
 
 /* ============================
