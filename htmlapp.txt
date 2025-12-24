@@ -1,0 +1,2487 @@
+firbase rules "rules_version = '2';
+
+service cloud.firestore {
+
+match /databases/{database}/documents {
+
+text
+
+// ============================================================
+// KONVO - ANONYMOUS CHAT PLATFORM SECURITY RULES
+// Version: 4.0 (Security Hardened - All Vulnerabilities Fixed)
+// ============================================================
+
+// ============================
+// 1. HELPER FUNCTIONS
+// ============================
+
+function isSignedIn() {
+  return request.auth != null && request.auth.uid != null;
+}
+
+function isBanned() {
+  return isSignedIn() &&
+         exists(/databases/$(database)/documents/banned_users/$(request.auth.uid));
+}
+
+function isActiveUser() {
+  return isSignedIn() && !isBanned();
+}
+
+function isAdmin() {
+  return isSignedIn() &&
+         !isBanned() &&
+         exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+}
+
+// ============================
+// 2. VALIDATION FUNCTIONS
+// ============================
+
+function isValidText() {
+  let text = request.resource.data.text;
+  return text is string
+         && text.size() > 0
+         && text.size() <= 500
+         && !text.matches('.*[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F].*');
+}
+
+function isServerTimestamp() {
+  return request.resource.data.timestamp == request.time;
+}
+
+function isValidCollection(col) {
+  return col in ['chat', 'confessions'];
+}
+
+// FIXED: Added rate limiting check
+function canSendMessage() {
+  let userDoc = get(/databases/$(database)/documents/users/$(request.auth.uid));
+  let lastMessage = userDoc.data.get('lastMessageAt', timestamp.date(1970, 1, 1));
+  
+  return isActiveUser()
+         && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+         && userDoc.data.username is string
+         && userDoc.data.username.size() >= 1
+         // Rate limit: 1 message per 2 seconds
+         && lastMessage + duration.value(2, 's') < request.time;
+}
+
+function isValidUsername(username) {
+  return username is string
+         && username.size() >= 1
+         && username.size() <= 30
+         && username.matches('^[a-zA-Z0-9_\\- ]+$')
+         // Must contain at least one alphanumeric character
+         && username.matches('.*[a-zA-Z0-9]+.*')
+         // Cannot start or end with space
+         && !username.matches('^\\s.*')
+         && !username.matches('.*\\s$')
+         // Reserved words - exact match
+         && username.lower() != 'anonymous'
+         && username.lower() != 'admin'
+         && username.lower() != 'moderator'
+         && username.lower() != 'system'
+         && username.lower() != 'konvo'
+         && username.lower() != 'mod'
+         && username.lower() != 'support'
+         && username.lower() != 'staff'
+         && username.lower() != 'official'
+         && username.lower() != 'root'
+         && username.lower() != 'owner'
+         && username.lower() != 'bot'
+         && username.lower() != 'help'
+         // Reserved words - contains
+         && !username.lower().matches('.*anonymous.*')
+         && !username.lower().matches('.*admin.*')
+         && !username.lower().matches('.*moderator.*')
+         && !username.lower().matches('.*konvo.*')
+         && !username.lower().matches('.*support.*')
+         && !username.lower().matches('.*staff.*')
+         && !username.lower().matches('.*official.*');
+}
+
+function isValidProfilePhotoURL(url) {
+  return url is string
+         && url.size() <= 500
+         && (
+           url.matches('^https://placehold\\.co/.*')
+           || url.matches('^https://ui-avatars\\.com/.*')
+           || url.matches('^https://api\\.dicebear\\.com/.*')
+         );
+}
+
+function isValidUserProfileCreate() {
+  let data = request.resource.data;
+  let allowedFields = ['username', 'profilePhotoURL', 'lastMessageAt'];
+  
+  return data.keys().hasOnly(allowedFields)
+         // Username is REQUIRED
+         && 'username' in data
+         && isValidUsername(data.username)
+         && (!('profilePhotoURL' in data) || isValidProfilePhotoURL(data.profilePhotoURL))
+         && (!('lastMessageAt' in data) || data.lastMessageAt == request.time);
+}
+
+function isValidUserProfileUpdate() {
+  let data = request.resource.data;
+  let changedFields = data.diff(resource.data).affectedKeys();
+  let allowedFields = ['username', 'profilePhotoURL', 'lastMessageAt'];
+  
+  return changedFields.hasOnly(allowedFields)
+         && (!('username' in changedFields) || isValidUsername(data.username))
+         && (!('profilePhotoURL' in changedFields) || isValidProfilePhotoURL(data.profilePhotoURL))
+         && (!('lastMessageAt' in changedFields) || data.lastMessageAt == request.time)
+         && !('banned' in changedFields);
+}
+
+function isValidAdminUserCreate() {
+  let data = request.resource.data;
+  return data.keys().hasOnly(['banned'])
+         && data.banned is bool;
+}
+
+function isValidAdminUserUpdate() {
+  let data = request.resource.data;
+  let changedFields = data.diff(resource.data).affectedKeys();
+  
+  return changedFields.hasOnly(['banned'])
+         && data.banned is bool;
+}
+
+function isValidTypingStatus() {
+  let data = request.resource.data;
+  let allowedFields = ['isTyping', 'timestamp'];
+  
+  return data.keys().hasOnly(allowedFields)
+         && data.isTyping is bool
+         && data.timestamp is int
+         && data.timestamp > 0
+         && data.timestamp <= request.time.toMillis() + 5000;
+}
+
+function isValidMessageCreate() {
+  let data = request.resource.data;
+  let allowedFields = ['text', 'timestamp', 'userId', 'replyTo'];
+  
+  return data.keys().hasOnly(allowedFields)
+         && data.userId == request.auth.uid
+         && isValidText()
+         && isServerTimestamp()
+         && (!('replyTo' in data) || isValidReplyTo(data.replyTo));
+}
+
+function isValidReplyTo(replyTo) {
+  return replyTo is map
+         && replyTo.keys().hasOnly(['messageId', 'userId', 'text'])
+         && replyTo.messageId is string
+         && replyTo.messageId.size() > 0
+         && replyTo.messageId.size() <= 100
+         && replyTo.userId is string
+         && replyTo.userId.size() > 0
+         && replyTo.userId.size() <= 128
+         && replyTo.text is string
+         && replyTo.text.size() <= 500;
+}
+
+function isValidHiddenForUpdate() {
+  let oldHiddenFor = resource.data.get('hiddenFor', []);
+  let newHiddenFor = request.resource.data.get('hiddenFor', []);
+  
+  return newHiddenFor is list
+         && newHiddenFor.size() <= 1000
+         && newHiddenFor.hasAll(oldHiddenFor)
+         && newHiddenFor.size() == oldHiddenFor.size() + 1
+         && request.auth.uid in newHiddenFor
+         && !(request.auth.uid in oldHiddenFor);
+}
+
+// FIXED: Stricter reaction validation with proper other-user check
+function isValidReactionsUpdate() {
+  let oldReactions = resource.data.get('reactions', {});
+  let newReactions = request.resource.data.reactions;
+  let validTypes = ['thumbsup', 'laugh', 'surprised', 'heart', 'skull'];
+  let uid = request.auth.uid;
+  
+  return newReactions is map
+         && newReactions.keys().hasOnly(validTypes)
+         && validateReactionArrays(newReactions, validTypes)
+         && validateUserReactionChange(oldReactions, newReactions, uid, validTypes)
+         && validateOtherUsersUnchanged(oldReactions, newReactions, uid);
+}
+
+function validateReactionArrays(reactions, validTypes) {
+  return (!('thumbsup' in reactions) || (reactions.thumbsup is list && reactions.thumbsup.size() <= 500))
+         && (!('laugh' in reactions) || (reactions.laugh is list && reactions.laugh.size() <= 500))
+         && (!('surprised' in reactions) || (reactions.surprised is list && reactions.surprised.size() <= 500))
+         && (!('heart' in reactions) || (reactions.heart is list && reactions.heart.size() <= 500))
+         && (!('skull' in reactions) || (reactions.skull is list && reactions.skull.size() <= 500));
+}
+
+// FIXED: Validate that only the current user's reaction changed
+function validateUserReactionChange(oldReactions, newReactions, uid, validTypes) {
+  let thumbsupDiff = getReactionDiff(oldReactions, newReactions, 'thumbsup', uid);
+  let laughDiff = getReactionDiff(oldReactions, newReactions, 'laugh', uid);
+  let surprisedDiff = getReactionDiff(oldReactions, newReactions, 'surprised', uid);
+  let heartDiff = getReactionDiff(oldReactions, newReactions, 'heart', uid);
+  let skullDiff = getReactionDiff(oldReactions, newReactions, 'skull', uid);
+  
+  // Exactly one reaction type should change for current user
+  let totalChanges = thumbsupDiff + laughDiff + surprisedDiff + heartDiff + skullDiff;
+  return totalChanges == 1 || totalChanges == -1;
+}
+
+function getReactionDiff(oldReactions, newReactions, reactionType, uid) {
+  let oldList = oldReactions.get(reactionType, []);
+  let newList = newReactions.get(reactionType, []);
+  let wasIn = uid in oldList;
+  let isIn = uid in newList;
+  
+  return (wasIn && !isIn) ? -1 : (!wasIn && isIn) ? 1 : 0;
+}
+
+// FIXED: New function to verify other users' reactions weren't modified
+function validateOtherUsersUnchanged(oldReactions, newReactions, uid) {
+  return validateSingleReactionOthersUnchanged(oldReactions, newReactions, 'thumbsup', uid)
+         && validateSingleReactionOthersUnchanged(oldReactions, newReactions, 'laugh', uid)
+         && validateSingleReactionOthersUnchanged(oldReactions, newReactions, 'surprised', uid)
+         && validateSingleReactionOthersUnchanged(oldReactions, newReactions, 'heart', uid)
+         && validateSingleReactionOthersUnchanged(oldReactions, newReactions, 'skull', uid);
+}
+
+function validateSingleReactionOthersUnchanged(oldReactions, newReactions, reactionType, uid) {
+  let oldList = oldReactions.get(reactionType, []);
+  let newList = newReactions.get(reactionType, []);
+  let oldWithoutUser = oldList.removeAll([uid]);
+  let newWithoutUser = newList.removeAll([uid]);
+  
+  // Verify other users' reactions are exactly the same
+  return oldWithoutUser.size() == newWithoutUser.size()
+         && oldWithoutUser.hasAll(newWithoutUser)
+         && newWithoutUser.hasAll(oldWithoutUser);
+}
+
+function isValidMessageEdit() {
+  let data = request.resource.data;
+  let oldData = resource.data;
+  let changedFields = data.diff(oldData).affectedKeys();
+  
+  return changedFields.hasOnly(['text', 'edited'])
+         && 'text' in changedFields
+         && data.edited == true
+         && data.userId == oldData.userId
+         && data.timestamp == oldData.timestamp
+         && oldData.timestamp is timestamp
+         && oldData.timestamp + duration.value(15, 'm') > request.time
+         && data.text is string
+         && data.text.size() > 0
+         && data.text.size() <= 500
+         && !data.text.matches('.*[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F].*');
+}
+
+function isValidAdminMessageUpdate() {
+  let data = request.resource.data;
+  let changedFields = data.diff(resource.data).affectedKeys();
+  
+  return changedFields.hasOnly(['isPinned'])
+         && data.isPinned is bool;
+}
+
+function isValidPinnedMessage() {
+  let data = request.resource.data;
+  let requiredFields = ['originalId', 'collection', 'text', 'pinnedBy', 'timestamp'];
+  
+  return data.keys().hasAll(requiredFields)
+         && data.keys().hasOnly(requiredFields)
+         && data.originalId is string
+         && data.originalId.size() > 0
+         && data.originalId.size() <= 100
+         && data.collection in ['chat', 'confessions']
+         && data.text is string
+         && data.text.size() <= 200
+         && data.pinnedBy == request.auth.uid
+         && data.timestamp == request.time;
+}
+
+function isValidBanRecord() {
+  let data = request.resource.data;
+  let requiredFields = ['bannedBy', 'timestamp'];
+  let allAllowedFields = ['bannedBy', 'timestamp', 'reason', 'username'];
+  
+  return data.keys().hasAll(requiredFields)
+         && data.keys().hasOnly(allAllowedFields)
+         && data.bannedBy == request.auth.uid
+         && data.timestamp == request.time
+         && (!('reason' in data) || (data.reason is string && data.reason.size() <= 500))
+         && (!('username' in data) || (data.username is string && data.username.size() <= 30));
+}
+
+// ============================
+// 3. DEVICE BAN VALIDATION (FIXED)
+// ============================
+
+function isValidDeviceBanRecord() {
+  let data = request.resource.data;
+  let requiredFields = ['fingerprint', 'bannedBy', 'timestamp'];
+  let allAllowedFields = ['fingerprint', 'userId', 'username', 'bannedBy', 'timestamp', 'reason', 'userAgent', 'platform'];
+  
+  return data.keys().hasAll(requiredFields)
+         && data.keys().hasOnly(allAllowedFields)
+         && data.fingerprint is string
+         && data.fingerprint.size() > 0
+         && data.fingerprint.size() <= 100
+         && data.bannedBy == request.auth.uid
+         && data.timestamp == request.time
+         && (!('userId' in data) || (data.userId is string && data.userId.size() <= 128))
+         && (!('username' in data) || (data.username is string && data.username.size() <= 30))
+         && (!('reason' in data) || (data.reason is string && data.reason.size() <= 500))
+         && (!('userAgent' in data) || data.userAgent == null || (data.userAgent is string && data.userAgent.size() <= 500))
+         && (!('platform' in data) || data.platform == null || (data.platform is string && data.platform.size() <= 100));
+}
+
+// FIXED: Made ipHash required
+function isValidIPBanRecord() {
+  let data = request.resource.data;
+  let requiredFields = ['bannedBy', 'timestamp', 'ipHash'];
+  let allAllowedFields = ['ipHash', 'ipAddress', 'userId', 'username', 'bannedBy', 'timestamp', 'reason'];
+  
+  return data.keys().hasAll(requiredFields)
+         && data.keys().hasOnly(allAllowedFields)
+         && data.bannedBy == request.auth.uid
+         && data.timestamp == request.time
+         && data.ipHash is string
+         && data.ipHash.size() > 0
+         && data.ipHash.size() <= 64
+         && (!('ipAddress' in data) || data.ipAddress == null || (data.ipAddress is string && data.ipAddress.size() <= 50))
+         && (!('userId' in data) || (data.userId is string && data.userId.size() <= 128))
+         && (!('username' in data) || (data.username is string && data.username.size() <= 30))
+         && (!('reason' in data) || (data.reason is string && data.reason.size() <= 500));
+}
+
+// FIXED: Self-ban validates username against actual profile
+function isValidSelfBanRecord() {
+  let data = request.resource.data;
+  let allowedFields = ['bannedBy', 'timestamp', 'reason', 'username'];
+  let userDoc = get(/databases/$(database)/documents/users/$(request.auth.uid));
+  let actualUsername = userDoc.data.get('username', '');
+  
+  return data.keys().hasOnly(allowedFields)
+         && data.bannedBy == "SYSTEM_AUTO_BAN"
+         && data.timestamp == request.time
+         && 'reason' in data
+         && data.reason is string
+         && data.reason.matches('.*[Ss]pam.*')
+         // Username must match actual profile or not be provided
+         && (!('username' in data) || data.username == actualUsername);
+}
+
+// FIXED: Document ID format is userId_fingerprint
+function isValidSelfDeviceBanRecord() {
+  let data = request.resource.data;
+  let docId = request.resource.id;
+  let expectedDocId = request.auth.uid + '_' + data.fingerprint;
+  let deviceDocId = request.auth.uid + '_' + data.fingerprint;
+  
+  return data.bannedBy == "SYSTEM_AUTO_BAN"
+         && data.timestamp == request.time
+         && 'reason' in data
+         && data.reason is string
+         && data.reason.matches('.*[Ss]pam.*')
+         && data.userId == request.auth.uid
+         && data.fingerprint is string
+         && data.fingerprint.size() > 0
+         && data.fingerprint.size() <= 100
+         // Verify this fingerprint is registered to this user
+         && exists(/databases/$(database)/documents/user_devices/$(deviceDocId))
+         && get(/databases/$(database)/documents/user_devices/$(deviceDocId)).data.userId == request.auth.uid;
+}
+
+// Note: IP verification should be done via Cloud Functions for proper verification
+function isValidSelfIPBanRecord() {
+  let data = request.resource.data;
+  
+  return data.bannedBy == "SYSTEM_AUTO_BAN"
+         && data.timestamp == request.time
+         && 'reason' in data
+         && data.reason is string
+         && data.reason.matches('.*[Ss]pam.*')
+         && data.userId == request.auth.uid
+         && 'ipHash' in data
+         && data.ipHash is string
+         && data.ipHash.size() > 0
+         && data.ipHash.size() <= 64;
+}
+
+// FIXED: Document ID must be userId_fingerprint format
+function isValidDeviceRegistration() {
+  let data = request.resource.data;
+  let allowedFields = ['userId', 'fingerprint', 'ipAddress', 'ipHash', 'userAgent', 'language', 'timezone', 'screenResolution', 'platform', 'firstSeen', 'lastSeen'];
+  let expectedDocId = request.auth.uid + '_' + data.fingerprint;
+  
+  return data.keys().hasOnly(allowedFields)
+         && data.userId == request.auth.uid
+         && data.fingerprint is string
+         && data.fingerprint.size() > 0
+         && data.fingerprint.size() <= 100
+         // Document ID must be userId_fingerprint for proper ownership
+         && request.resource.id == expectedDocId
+         && (!('ipAddress' in data) || data.ipAddress == null || (data.ipAddress is string && data.ipAddress.size() <= 50))
+         && (!('ipHash' in data) || data.ipHash == null || (data.ipHash is string && data.ipHash.size() <= 64))
+         && (!('userAgent' in data) || (data.userAgent is string && data.userAgent.size() <= 500))
+         && (!('language' in data) || (data.language is string && data.language.size() <= 20))
+         && (!('timezone' in data) || data.timezone == null || (data.timezone is string && data.timezone.size() <= 100))
+         && (!('screenResolution' in data) || (data.screenResolution is string && data.screenResolution.size() <= 20))
+         && (!('platform' in data) || (data.platform is string && data.platform.size() <= 50));
+}
+
+function isValidDeviceUpdate() {
+  let data = request.resource.data;
+  let oldData = resource.data;
+  
+  return data.userId == request.auth.uid
+         && oldData.userId == request.auth.uid
+         && data.fingerprint == oldData.fingerprint
+         // Ensure document ID matches expected format
+         && request.resource.id == (request.auth.uid + '_' + data.fingerprint);
+}
+
+// ============================
+// 4. USER PROFILES (/users)
+// ============================
+
+match /users/{userId} {
+  allow read: if isSignedIn();
+
+  allow create: if (
+                  isActiveUser()
+                  && request.auth.uid == userId
+                  && isValidUserProfileCreate()
+                ) || (
+                  isAdmin()
+                  && isValidAdminUserCreate()
+                );
+
+  allow update: if (
+                  isActiveUser()
+                  && request.auth.uid == userId
+                  && isValidUserProfileUpdate()
+                ) || (
+                  isAdmin()
+                  && isValidAdminUserUpdate()
+                ) || (
+                  // Self-ban for spam
+                  isSignedIn()
+                  && request.auth.uid == userId
+                  && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['banned'])
+                  && request.resource.data.banned == true
+                );
+
+  allow delete: if isAdmin();
+}
+
+// ============================
+// 5. TYPING STATUS (/typingStatus)
+// ============================
+
+match /typingStatus/{docId} {
+  allow read: if isSignedIn();
+
+  allow write: if isActiveUser()
+               && request.auth.uid == docId
+               && isValidTypingStatus();
+}
+
+// ============================
+// 6. BANNED USERS (/banned_users)
+// ============================
+
+match /banned_users/{oduserId} {
+  allow read: if isAdmin() ||
+              (isSignedIn() && request.auth.uid == oduserId);
+
+  allow create: if (isAdmin() && isValidBanRecord()) ||
+                (isSignedIn() && request.auth.uid == oduserId && isValidSelfBanRecord());
+
+  allow update: if isAdmin();
+
+  allow delete: if isAdmin();
+}
+
+// ============================
+// 7. BANNED DEVICES (/banned_devices) - FIXED
+// ============================
+
+match /banned_devices/{fingerprintId} {
+  // Restrict read access - only admin or device owner can read
+  allow read: if isAdmin() ||
+              (isSignedIn() && 
+               exists(/databases/$(database)/documents/user_devices/$(request.auth.uid + '_' + fingerprintId)) &&
+               get(/databases/$(database)/documents/user_devices/$(request.auth.uid + '_' + fingerprintId)).data.userId == request.auth.uid);
+
+  allow create: if (isAdmin() && isValidDeviceBanRecord()) ||
+                (isSignedIn() && isValidSelfDeviceBanRecord());
+
+  allow update: if isAdmin();
+
+  allow delete: if isAdmin();
+}
+
+// ============================
+// 8. BANNED IPS (/banned_ips) - FIXED
+// ============================
+
+match /banned_ips/{ipId} {
+  // Only admins can read/write IP bans
+  // Client-side IP ban checking should use Cloud Functions
+  allow read: if isAdmin();
+
+  allow create: if isAdmin() && isValidIPBanRecord();
+
+  allow update: if isAdmin();
+
+  allow delete: if isAdmin();
+}
+
+// ============================
+// 9. USER DEVICES (/user_devices) - FIXED
+// ============================
+
+match /user_devices/{deviceDocId} {
+  allow read: if isAdmin() ||
+              (isSignedIn() && resource.data.userId == request.auth.uid);
+
+  // FIXED: Verify document ID starts with user's UID
+  allow create: if isActiveUser() 
+                && isValidDeviceRegistration()
+                && deviceDocId.matches('^' + request.auth.uid + '_.*');
+
+  allow update: if isActiveUser() 
+                && isValidDeviceUpdate()
+                && deviceDocId.matches('^' + request.auth.uid + '_.*');
+
+  allow delete: if isAdmin();
+}
+
+// ============================
+// 10. PINNED MESSAGES (/pinned_messages)
+// ============================
+
+match /pinned_messages/{docId} {
+  allow read: if isSignedIn();
+
+  allow create: if isAdmin() && isValidPinnedMessage();
+
+  allow update: if isAdmin();
+
+  allow delete: if isAdmin();
+}
+
+// ============================
+// 11. ADMIN LIST (/admins) - LOCKED
+// ============================
+
+match /admins/{docId} {
+  allow read: if isAdmin();
+
+  // Admin list can only be modified through Firebase Console or Admin SDK
+  allow write: if false;
+}
+
+// ============================
+// 12. CHAT & CONFESSIONS (/chat, /confessions) - FIXED
+// ============================
+
+match /{collection}/{docId} {
+  allow read: if isValidCollection(collection) && isSignedIn();
+
+  allow create: if isValidCollection(collection)
+                && canSendMessage()
+                && isValidMessageCreate();
+
+  allow update: if isValidCollection(collection)
+                && !isBanned()
+                && (
+                  // Admin can pin/unpin messages
+                  (
+                    isAdmin()
+                    && isValidAdminMessageUpdate()
+                  )
+                  ||
+                  // User can edit their own message within 15 minutes
+                  (
+                    isActiveUser()
+                    && resource.data.userId == request.auth.uid
+                    && isValidMessageEdit()
+                  )
+                  ||
+                  // Users can add/remove their own reactions
+                  (
+                    isActiveUser()
+                    && request.resource.data.diff(resource.data)
+                       .affectedKeys()
+                       .hasOnly(['reactions'])
+                    && isValidReactionsUpdate()
+                  )
+                  ||
+                  // Users can hide messages for themselves
+                  (
+                    isActiveUser()
+                    && request.resource.data.diff(resource.data)
+                       .affectedKeys()
+                       .hasOnly(['hiddenFor'])
+                    && isValidHiddenForUpdate()
+                  )
+                );
+
+  allow delete: if isValidCollection(collection)
+                && !isBanned()
+                && (
+                  (isActiveUser() && resource.data.userId == request.auth.uid)
+                  ||
+                  isAdmin()
+                );
+}
+
+// ============================
+// 13. CATCH-ALL DENY
+// ============================
+
+// This rule ensures any collection not explicitly defined above is denied
+// Note: Firestore rules use OR logic, so this doesn't override rules above
+match /{document=**} {
+  allow read, write: if false;
+}
+
+}
+}", html "<!DOCTYPE html>
+<html lang="en"> <head> <meta charset="UTF-8" /> <meta name="viewport" content="width=device-width, initial-scale=1.0" /> <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+
+text
+
+<!-- Security Meta Tags -->
+<meta name="referrer" content="strict-origin-when-cross-origin" />
+<meta http-equiv="X-Content-Type-Options" content="nosniff" />
+
+<!-- SEO & PWA Meta Tags -->
+<meta name="description" content="Konvo - Anonymous chat platform for open conversations. Share confessions and chat anonymously." />
+<meta name="theme-color" content="#0a0a0a" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Konvo" />
+
+<title>Konvo // Anonymous Chat</title>
+
+<!-- Favicon & Icons -->
+<link rel="icon" type="image/png" href="/favicon.png?v=8" />
+<link rel="shortcut icon" type="image/png" href="/favicon.png?v=8" />
+<link rel="icon" type="image/jpeg" href="/icon.jpg?v=8" />
+<link rel="apple-touch-icon" href="/icon.jpg" />
+
+<!-- PWA Manifest -->
+<link rel="manifest" href="manifest.json" />
+
+<!-- Preconnect for Performance -->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="preconnect" href="https://www.gstatic.com" crossorigin />
+<link rel="preconnect" href="https://firestore.googleapis.com" crossorigin />
+
+<!-- Google Fonts -->
+<link
+  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+  rel="stylesheet"
+/>
+
+<!-- Compiled Stylesheet (includes Tailwind) -->
+<link rel="stylesheet" href="dist/style.css" />
+
+</head> <body class="flex flex-col bg-[#0a0a0a] h-dvh"> <!-- Ban Check Overlay (shows while checking device status) --> <div id="banCheckOverlay" class="ban-check-overlay"> <div class="text-center"> <div class="ban-check-text">VERIFYING ACCESS...</div> </div> </div>
+
+text
+
+<!-- Header -->
+<header
+  class="flex justify-between items-center px-3 py-3 border-b border-[#333333] bg-[#0a0a0a] gap-2 z-10 h-14"
+>
+  <h1 class="text-base sm:text-2xl font-bold text-white tracking-tight shrink-0">
+    KONVO
+  </h1>
+  
+  <div class="flex items-center gap-2 overflow-visible flex-1 justify-end">
+    <nav class="flex text-[10px] sm:text-base font-medium gap-1 sm:gap-4 shrink">
+      <div 
+        id="navConfessions" 
+        class="nav-item px-2 py-1"
+        role="button"
+        tabindex="0"
+        aria-label="View Confessions"
+      >
+        <span class="block truncate">CONFESSIONS</span>
+      </div>
+      <div 
+        id="navChat" 
+        class="nav-item active px-2 py-1"
+        role="button"
+        tabindex="0"
+        aria-label="View Chat"
+      >
+        <span class="block truncate">CHAT</span>
+      </div>
+    </nav>
+
+    <div class="flex items-center gap-1 sm:gap-2 shrink-0">
+      <!-- Notification Button -->
+      <button
+        id="notificationButton"
+        type="button"
+        class="p-2 rounded-full hover:bg-[#262626] transition text-[#ededed] flex items-center justify-center focus:outline-none focus-visible:ring-2 focus-visible:ring-white"
+        title="Toggle Notifications"
+        aria-label="Toggle Notifications"
+      >
+        <svg 
+          xmlns="http://www.w3.org/2000/svg" 
+          width="18" 
+          height="18" 
+          viewBox="0 0 24 24" 
+          fill="none" 
+          stroke="currentColor" 
+          stroke-width="2" 
+          stroke-linecap="round" 
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+          <path d="M18.63 13A17.89 17.89 0 0 1 18 8"></path>
+          <path d="M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14"></path>
+          <path d="M18 8a6 6 0 0 0-9.33-5"></path>
+          <line x1="1" y1="1" x2="23" y2="23"></line>
+        </svg>
+      </button>
+
+      <!-- Profile Button -->
+      <button
+        id="profileButton"
+        type="button"
+        class="p-2 rounded-full hover:bg-[#262626] transition text-[#ededed] flex items-center justify-center focus:outline-none focus-visible:ring-2 focus-visible:ring-white"
+        title="Edit Profile"
+        aria-label="Edit Profile"
+      >
+        <svg
+          width="18"
+          height="18"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+        >
+          <path
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
+          ></path>
+        </svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<!-- Main Content -->
+<main class="flex-1 flex flex-col overflow-hidden relative">
+  <!-- Pinned Message Bar -->
+  <div 
+    id="pinnedMessageBar" 
+    class="hidden flex items-center gap-3 px-4 py-2 bg-[#1c1c1c] border-b border-[#333] z-20 shadow-lg cursor-pointer hover:bg-[#262626] transition-colors shrink-0"
+    role="button"
+    tabindex="0"
+    aria-label="View pinned message"
+  >
+    <span class="text-lg shrink-0" aria-hidden="true">📌</span>
+    <div class="flex flex-col overflow-hidden">
+      <span class="text-[10px] text-[#fbbf24] font-bold uppercase tracking-wider">Pinned Message</span>
+      <p id="pinnedMessageText" class="text-sm text-white truncate"></p>
+    </div>
+  </div>
+
+  <!-- Feed Container -->
+  <div
+    id="feedContainer"
+    class="flex-1 flex flex-col p-2 sm:p-4 gap-2 overflow-y-auto"
+    role="log"
+    aria-live="polite"
+    aria-label="Messages"
+  >
+    <div id="loading" class="text-center p-4 text-[#888888] text-sm">
+      CONNECTING...
+    </div>
+  </div>
+
+  <!-- Scroll to Bottom Button -->
+  <button 
+    id="scrollToBottomBtn" 
+    class="hidden"
+    type="button"
+    aria-label="Scroll to bottom"
+    title="Scroll to latest messages"
+  >
+    <span id="newMsgCount" class="hidden" aria-live="polite">0</span>
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M7 13l5 5 5-5M7 6l5 5 5-5" />
+    </svg>
+  </button>
+
+  <!-- Selection Bar -->
+  <div
+    id="selectionBar"
+    class="hidden flex justify-between items-center bg-[#1c1c1c] border-t border-[#333] p-3"
+    role="toolbar"
+    aria-label="Message selection actions"
+  >
+    <span id="selectionCount" class="text-base text-white font-medium" aria-live="polite">
+      0 selected
+    </span>
+    <div class="flex gap-4">
+      <button
+        id="selectionCancel"
+        type="button"
+        class="text-sm font-medium text-[#888888] hover:text-white transition"
+        aria-label="Cancel selection"
+      >
+        CANCEL
+      </button>
+      <button
+        id="selectionDelete"
+        type="button"
+        class="text-sm font-bold text-red-500 hover:text-red-400 transition"
+        aria-label="Delete selected messages"
+      >
+        DELETE
+      </button>
+    </div>
+  </div>
+
+  <!-- Reply Bar -->
+  <div id="replyBar" role="status" aria-label="Replying to message">
+    <div class="reply-info">
+      <div class="reply-author" id="replyAuthor"></div>
+      <div class="reply-text" id="replyText"></div>
+    </div>
+    <button 
+      id="cancelReply" 
+      type="button"
+      title="Cancel reply"
+      aria-label="Cancel reply"
+    >
+      ✕
+    </button>
+  </div>
+
+  <!-- Typing Indicator -->
+  <div 
+    id="typingIndicator" 
+    class="px-4 h-6 text-xs text-[#888]"
+    aria-live="polite"
+    aria-atomic="true"
+  >
+    &nbsp;
+  </div>
+
+  <!-- Confession Form -->
+  <form 
+    id="confessionForm" 
+    class="hidden gap-3 border-t border-[#333] relative"
+    aria-label="Post a confession"
+  >
+    <label for="confessionInput" class="sr-only">Type your confession</label>
+
+    <div class="relative flex-1">
+      <textarea
+        id="confessionInput"
+        rows="1"
+        class="w-full resize-none focus:outline-none text-sm pr-16"
+        placeholder="Type your confession..."
+        required
+        maxlength="500"
+        autocomplete="off"
+        spellcheck="true"
+      ></textarea>
+
+      <!-- Character Counter -->
+      <span 
+        id="confessionCharCount" 
+        class="char-counter"
+        aria-live="polite"
+        aria-label="Character count"
+      >0/500</span>
+    </div>
+    
+    <button
+      id="confessionButton"
+      type="submit"
+      class="px-5 py-2 rounded-lg font-bold text-sm bg-white text-black hover:bg-[#cccccc] transition focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-white"
+    >
+      POST
+    </button>
+  </form>
+
+  <!-- Chat Form -->
+  <form 
+    id="chatForm" 
+    class="flex gap-3 border-t border-[#333] relative"
+    aria-label="Send a message"
+  >
+    <label for="chatInput" class="sr-only">Type a message</label>
+
+    <div class="relative flex-1">
+      <textarea
+        id="chatInput"
+        rows="1"
+        class="w-full resize-none focus:outline-none text-sm pr-16"
+        placeholder="Type a message..."
+        required
+        maxlength="500"
+        autocomplete="off"
+        spellcheck="true"
+      ></textarea>
+
+      <!-- Character Counter -->
+      <span 
+        id="chatCharCount" 
+        class="char-counter"
+        aria-live="polite"
+        aria-label="Character count"
+      >0/500</span>
+    </div>
+    
+    <button
+      id="chatButton"
+      type="submit"
+      class="px-5 py-2 rounded-lg font-bold text-sm bg-white text-black hover:bg-[#cccccc] transition focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-white"
+    >
+      SEND
+    </button>
+  </form>
+</main>
+
+<!-- Profile Modal -->
+<div 
+  id="profileModal" 
+  class="modal-base"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="profileModalTitle"
+  aria-hidden="true"
+>
+  <div
+    class="modal-content bg-[#1c1c1c] p-6 rounded-xl border border-[#333] w-full max-w-sm flex flex-col gap-4 shadow-2xl"
+  >
+    <h2 id="profileModalTitle" class="text-xl font-bold text-white">Edit Profile</h2>
+    <div class="flex flex-col gap-2">
+      <label
+        for="modalUsernameInput"
+        class="text-xs font-medium text-[#888]"
+      >
+        USERNAME
+      </label>
+      <input
+        type="text"
+        id="modalUsernameInput"
+        placeholder="Enter username"
+        class="w-full p-3 rounded-lg focus:outline-none bg-[#0a0a0a] text-white border border-[#333] text-sm focus-visible:ring-2 focus-visible:ring-white"
+        maxlength="30"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        pattern="^[a-zA-Z0-9_\- ]+$"
+        title="Only letters, numbers, spaces, underscores, and hyphens allowed"
+      />
+    </div>
+    <div class="flex gap-3 mt-4">
+      <button
+        id="modalCloseButton"
+        type="button"
+        class="flex-1 px-4 py-2 rounded-lg font-medium text-sm bg-transparent border border-[#333] text-[#888] hover:text-white hover:border-white transition"
+      >
+        Cancel
+      </button>
+      <button
+        id="modalSaveButton"
+        type="button"
+        class="flex-1 px-4 py-2 rounded-lg font-bold text-sm bg-white text-black hover:bg-[#ddd] transition"
+      >
+        Save
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Message Modal -->
+<div 
+  id="editModal" 
+  class="modal-base"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="editModalTitle"
+  aria-hidden="true"
+>
+  <div
+    class="modal-content bg-[#1c1c1c] p-6 rounded-xl border border-[#333] w-full max-w-sm flex flex-col gap-4 shadow-2xl"
+  >
+    <h2 id="editModalTitle" class="text-xl font-bold text-white">Edit Message</h2>
+    <label for="modalEditTextArea" class="sr-only">Edit your message</label>
+    <textarea
+      id="modalEditTextArea"
+      rows="4"
+      class="w-full p-3 rounded-lg resize-none focus:outline-none bg-[#0a0a0a] text-white border border-[#333] text-sm focus-visible:ring-2 focus-visible:ring-white"
+      maxlength="500"
+      spellcheck="true"
+    ></textarea>
+    <div class="flex gap-3 mt-4">
+      <button
+        id="editModalCancelButton"
+        type="button"
+        class="flex-1 px-4 py-2 rounded-lg font-medium text-sm bg-transparent border border-[#333] text-[#888] hover:text-white hover:border-white transition"
+      >
+        Cancel
+      </button>
+      <button
+        id="editModalSaveButton"
+        type="button"
+        class="flex-1 px-4 py-2 rounded-lg font-bold text-sm bg-white text-black hover:bg-[#ddd] transition"
+      >
+        Save
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm Modal -->
+<div 
+  id="confirmModal" 
+  class="modal-base"
+  role="alertdialog"
+  aria-modal="true"
+  aria-labelledby="confirmModalTitle"
+  aria-describedby="confirmModalText"
+  aria-hidden="true"
+>
+  <div
+    class="modal-content bg-[#1c1c1c] p-6 rounded-xl border border-[#333] w-full max-w-sm flex flex-col gap-4 shadow-2xl"
+  >
+    <h2 id="confirmModalTitle" class="text-lg font-bold text-white">Confirm</h2>
+    <p id="confirmModalText" class="text-sm text-[#888]">Are you sure?</p>
+    <div class="flex gap-3 mt-4">
+      <button
+        id="confirmModalNoButton"
+        type="button"
+        class="flex-1 px-4 py-2 rounded-lg font-medium text-sm bg-transparent border border-[#333] text-[#888] hover:text-white hover:border-white transition"
+      >
+        Cancel
+      </button>
+      <div id="confirmModalActionContainer" class="flex gap-2 flex-1">
+        <button id="confirmModalYesButton" type="button" class="hidden">Yes</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Context Menu -->
+<div 
+  id="contextMenu"
+  role="menu"
+  aria-label="Message actions"
+>
+  <ul role="none">
+    <li id="menuEdit" role="menuitem" tabindex="-1">Edit Message</li>
+    <li id="menuDelete" role="menuitem" tabindex="-1" class="text-red-500 hover:text-red-400">
+      Delete Message
+    </li>
+    <li class="separator" role="separator"></li>
+    <li id="menuSelect" role="menuitem" tabindex="-1">Select</li>
+  </ul>
+</div>
+
+<!-- FingerprintJS CDN -->
+<script src="https://cdn.jsdelivr.net/npm/@fingerprintjs/fingerprintjs@3/dist/fp.min.js"></script>
+
+<!-- App Script -->
+<script type="module" src="app.js"></script>
+
+</body> </html>", input.css "/* Tailwind Base Directives */ @tailwind base; @tailwind components; @tailwind utilities;
+
+/* ============================================================
+KONVO - OBSIDIAN THEME
+Version: 2.2 (CSP Compliant)
+============================================================ */
+
+/* Import your existing custom styles below @tailwind directives */
+
+/* ============================
+
+    CSS CUSTOM PROPERTIES
+    ============================ /
+    :root {
+    / Color Palette */
+    --bg-color: #0a0a0a;
+    --surface: #1c1c1c;
+    --border-color: #333333;
+    --text-main: #ededed;
+    --text-muted: #888888;
+    --accent: #ffffff;
+    --danger: #ef4444;
+    --success: #22c55e;
+    --warning: #fbbf24;
+    --highlight: #262626;
+
+/* Animation Timing */
+--ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+--ease-out-smooth: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+
+/* Spacing */
+--spacing-xs: 0.25rem;
+--spacing-sm: 0.5rem;
+--spacing-md: 1rem;
+--spacing-lg: 1.5rem;
+--spacing-xl: 2rem;
+
+/* Border Radius */
+--radius-sm: 4px;
+--radius-md: 8px;
+--radius-lg: 12px;
+--radius-full: 9999px;
+
+/* Z-Index Layers */
+--z-base: 1;
+--z-dropdown: 100;
+--z-sticky: 200;
+--z-modal: 1000;
+--z-tooltip: 1100;
+}
+
+/* Add after your :root section */
+html, body {
+height: 100%;
+min-height: 100vh;
+min-height: 100dvh;
+min-height: 100svh;
+}
+
+@supports (height: 100dvh) {
+body {
+height: 100dvh;
+}
+}
+/* ============================
+PASTE THE REST OF YOUR style.css CONTENT HERE
+(Everything from section 2 onwards)
+============================ */
+
+/* ... rest of your existing style.css ... /
+/ ============================
+2. BASE STYLES & RESETS
+============================ */
+
+*,
+*::before,
+*::after {
+box-sizing: border-box;
+}
+
+html {
+-moz-text-size-adjust: none;
+-webkit-text-size-adjust: none;
+text-size-adjust: none;
+}
+
+body {
+font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+background-color: var(--bg-color);
+color: var(--text-main);
+overflow-x: hidden;
+line-height: 1.5;
+margin: 0;
+padding: 0;
+overscroll-behavior: none;
+}
+
+/* ============================
+3. SECURITY-FOCUSED STYLES
+============================ */
+
+button,
+a,
+input,
+textarea,
+[role="button"],
+[tabindex] {
+-webkit-tap-highlight-color: transparent;
+-webkit-touch-callout: none;
+}
+
+.sr-only {
+position: absolute;
+width: 1px;
+height: 1px;
+padding: 0;
+margin: -1px;
+overflow: hidden;
+clip: rect(0, 0, 0, 0);
+white-space: nowrap;
+border: 0;
+}
+
+.no-select {
+-webkit-user-select: none;
+-moz-user-select: none;
+-ms-user-select: none;
+user-select: none;
+}
+
+a[target="_blank"]::after {
+content: " ↗";
+font-size: 0.75em;
+opacity: 0.7;
+}
+
+[hidden],
+.hidden {
+display: none !important;
+pointer-events: none !important;
+visibility: hidden !important;
+}
+
+img {
+-webkit-user-drag: none;
+user-select: none;
+pointer-events: auto;
+}
+
+/* ============================
+4. SCROLLBAR STYLES
+============================ */
+
+::-webkit-scrollbar {
+width: 6px;
+height: 6px;
+}
+
+::-webkit-scrollbar-track {
+background: var(--bg-color);
+}
+
+::-webkit-scrollbar-thumb {
+background: #333;
+border-radius: 3px;
+transition: background 0.3s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+background: #555;
+}
+
+    {
+    scrollbar-width: thin;
+    scrollbar-color: #333 var(--bg-color);
+    }
+
+/* ============================
+5. FORM ELEMENTS
+============================ */
+
+textarea,
+button,
+input[type="text"],
+input[type="email"],
+input[type="password"] {
+font-family: "Inter", sans-serif;
+background-color: var(--surface);
+border: 1px solid var(--border-color);
+color: var(--text-main);
+transition: all 0.2s ease;
+font-size: 1rem;
+}
+
+textarea::placeholder,
+input::placeholder {
+color: var(--text-muted);
+opacity: 1;
+}
+
+textarea:focus,
+input[type="text"]:focus,
+input[type="email"]:focus,
+input[type="password"]:focus {
+outline: none;
+background-color: var(--highlight);
+border-color: var(--text-muted);
+box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.05);
+}
+
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+-webkit-box-shadow: 0 0 0 1000px var(--surface) inset !important;
+-webkit-text-fill-color: var(--text-main) !important;
+caret-color: var(--text-main);
+}
+
+button {
+cursor: pointer;
+border: 1px solid var(--border-color);
+transition: all 0.2s ease;
+}
+
+button:hover:not(:disabled) {
+background-color: var(--text-main);
+color: var(--bg-color);
+border-color: var(--text-main);
+transform: translateY(-1px);
+}
+
+button:active:not(:disabled) {
+transform: translateY(0);
+}
+
+button:disabled {
+opacity: 0.5;
+cursor: not-allowed;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+outline: 2px solid var(--accent);
+outline-offset: 2px;
+}
+
+/* ============================
+6. ANIMATIONS
+============================ */
+
+@media (prefers-reduced-motion: reduce) {
+*,
+*::before,
+*::after {
+animation-duration: 0.01ms !important;
+animation-iteration-count: 1 !important;
+transition-duration: 0.01ms !important;
+scroll-behavior: auto !important;
+}
+}
+
+@keyframes smoothSlideUp {
+0% {
+opacity: 0;
+transform: translateY(15px) scale(0.98);
+}
+100% {
+opacity: 1;
+transform: translateY(0) scale(1);
+}
+}
+
+@keyframes systemPulse {
+0%, 100% {
+opacity: 0.3;
+}
+50% {
+opacity: 1;
+text-shadow: 0 0 8px rgba(255, 255, 255, 0.2);
+}
+}
+
+@keyframes modalZoom {
+0% {
+opacity: 0;
+transform: scale(0.95) translateY(10px);
+}
+100% {
+opacity: 1;
+transform: scale(1) translateY(0);
+}
+}
+
+@keyframes fadeIn {
+from {
+opacity: 0;
+}
+to {
+opacity: 1;
+}
+}
+
+@keyframes shake {
+0%, 100% {
+transform: translateX(0);
+}
+10%, 30%, 50%, 70%, 90% {
+transform: translateX(-5px);
+}
+20%, 40%, 60%, 80% {
+transform: translateX(5px);
+}
+}
+
+.shake {
+animation: shake 0.5s ease-in-out;
+}
+
+/* ============================
+7. LOADING STATE
+============================ */
+
+#loading {
+animation: systemPulse 2s infinite ease-in-out;
+font-family: 'Courier New', Courier, monospace;
+letter-spacing: 2px;
+font-size: 0.8rem;
+color: var(--text-muted);
+}
+
+/* ============================
+8. FEED CONTAINER
+============================ */
+
+#feedContainer {
+background-color: transparent;
+overflow-y: auto;
+overflow-x: hidden; /* prevent sideways scroll when a row overflows */
+scroll-behavior: smooth;
+padding-bottom: 20px;
+overflow-anchor: none;
+contain: layout style;
+}
+
+/* ============================
+9. MESSAGE BUBBLES (FIXED)
+============================ */
+
+.message-bubble {
+background-color: var(--surface);
+border: 1px solid var(--border-color);
+word-wrap: break-word;
+white-space: pre-wrap;
+overflow-wrap: anywhere; /* stronger than break-word for long unbroken strings /
+word-break: break-word;
+hyphens: auto;
+padding: 0.75rem 1rem;
+position: relative;
+transition: background-color 0.2s, transform 0.2s, border-color 0.2s;
+margin-bottom: 2px;
+display: flex;
+flex-direction: column;
+min-width: 140px;
+max-width: 100%;
+z-index: var(--z-base);
+cursor: default;
+color: var(--text-main);
+border-radius: var(--radius-lg);
+animation: smoothSlideUp 0.4s var(--ease-out-expo) forwards;
+will-change: transform, opacity;
+/ FIXED: Removed contain: content - was clipping kebab button /
+/ FIXED: Ensure overflow is visible */
+overflow: visible;
+}
+
+.message-bubble:hover {
+border-color: #444;
+background-color: #232323;
+}
+
+body.selection-mode .message-bubble {
+cursor: pointer;
+border-style: dashed;
+}
+
+.message-bubble.has-reactions {
+margin-bottom: 24px !important;
+}
+
+.my-message {
+background-color: #262626;
+border: 1px solid var(--border-color);
+align-self: flex-end;
+}
+
+.selected-message {
+background-color: #333 !important;
+border-color: var(--text-main) !important;
+transform: scale(1.01);
+}
+
+.message-bubble.pinned {
+border-left: 4px solid var(--warning) !important;
+}
+
+/* ============================
+10. MESSAGE FOOTER
+============================ */
+
+.bubble-footer {
+display: flex;
+align-items: center;
+margin-top: 6px;
+width: 100%;
+height: 14px;
+}
+
+.inner-timestamp {
+font-size: 0.65rem;
+color: var(--text-muted);
+opacity: 0.5;
+font-weight: 500;
+white-space: nowrap;
+transition: opacity 0.3s ease;
+}
+
+.message-bubble:hover .inner-timestamp {
+opacity: 1;
+color: var(--text-main);
+}
+
+.edited-marker {
+font-size: 0.5rem;
+opacity: 0.5;
+margin-right: 4px;
+font-style: italic;
+}
+
+/* ============================
+11. BUBBLE WRAPPER
+============================ */
+
+.bubble-wrapper {
+position: relative;
+display: inline-flex;
+flex-direction: column;
+align-items: flex-start;
+max-width: 100%;
+min-width: 0; /* allow bubble to shrink instead of forcing horizontal overflow */
+}
+
+.bubble-wrapper.my-bubble-wrapper {
+align-items: flex-end;
+}
+
+/* ============================
+12. KEBAB MENU BUTTON (TOP CORNER OUTSIDE)
+============================ */
+
+.kebab-btn {
+position: absolute;
+top: 0;
+right: -32px;
+width: 26px;
+height: 26px;
+padding: 0;
+border-radius: 50%;
+background: var(--surface);
+border: 1px solid var(--border-color);
+color: var(--text-muted);
+opacity: 0;
+visibility: hidden;
+cursor: pointer;
+display: flex;
+align-items: center;
+justify-content: center;
+transition: all 0.3s var(--ease-out-expo);
+z-index: calc(var(--z-base) + 50);
+box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+transform: scale(0.8);
+}
+
+/* For my messages - position at top-left corner outside */
+.bubble-wrapper.my-bubble-wrapper .kebab-btn {
+right: auto;
+left: -32px;
+}
+
+/* Show on message-wrapper hover - same as reaction/reply */
+.message-wrapper:hover .kebab-btn {
+opacity: 0.4;
+visibility: visible;
+transform: scale(1);
+}
+
+.kebab-btn:hover {
+opacity: 1 !important;
+visibility: visible !important;
+background-color: var(--text-main);
+color: var(--bg-color);
+border-color: var(--text-main);
+transform: scale(1.15) !important;
+}
+
+.kebab-btn:focus {
+opacity: 1;
+visibility: visible;
+transform: scale(1);
+outline: 2px solid var(--accent);
+outline-offset: 2px;
+}
+
+/* Touch devices - always show */
+@media (hover: none) and (pointer: coarse) {
+.kebab-btn {
+opacity: 0.5;
+visibility: visible;
+transform: scale(1);
+}
+
+.message-wrapper:active .kebab-btn {
+opacity: 1;
+}
+}
+
+/* Small screens - adjust position */
+@media (max-width: 640px) {
+.kebab-btn {
+width: 24px;
+height: 24px;
+right: -28px;
+}
+
+.bubble-wrapper.my-bubble-wrapper .kebab-btn {
+right: auto;
+left: -28px;
+}
+
+/* On mobile, account for always-visible side action buttons to avoid horizontal scrolling */
+.message-bubble {
+max-width: calc(100vw - 140px);
+}
+}
+
+/* Extra small screens - tighter position */
+@media (max-width: 400px) {
+.kebab-btn {
+right: -22px;
+width: 22px;
+height: 22px;
+}
+
+.bubble-wrapper.my-bubble-wrapper .kebab-btn {
+right: auto;
+left: -22px;
+}
+}
+
+/* ============================
+13. PROFILE PHOTOS
+============================ */
+
+.chat-pfp {
+width: 32px;
+height: 32px;
+border-radius: 50%;
+border: 1px solid rgba(255, 255, 255, 0.2);
+object-fit: cover;
+flex-shrink: 0;
+transition: all 0.3s ease;
+filter: grayscale(100%);
+background-color: var(--surface);
+}
+
+.message-bubble:hover .chat-pfp {
+filter: grayscale(0%);
+border-color: var(--text-main);
+transform: scale(1.05);
+}
+
+.chat-pfp[src=""],
+.chat-pfp:not([src]) {
+background: linear-gradient(135deg, var(--surface) 0%, var(--highlight) 100%);
+}
+
+/* ============================
+14. ADMIN BADGE
+============================ */
+
+.admin-badge {
+background-color: var(--text-main);
+color: var(--bg-color);
+font-size: 0.55rem;
+padding: 1px 5px;
+border-radius: 3px;
+font-weight: 800;
+letter-spacing: 0.5px;
+margin: 0 6px;
+align-self: center;
+text-transform: uppercase;
+box-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
+user-select: none;
+pointer-events: none;
+}
+
+/* ============================
+15. MESSAGE WRAPPER & ACTIONS
+============================ */
+
+.message-wrapper {
+display: flex;
+align-items: flex-end;
+gap: 8px;
+max-width: 100%;
+min-width: 0;
+}
+
+.side-action-btn {
+background: none;
+border: none;
+color: var(--text-muted);
+opacity: 0;
+cursor: pointer;
+width: 28px;
+height: 28px;
+border-radius: 50%;
+display: flex;
+align-items: center;
+justify-content: center;
+font-size: 1rem;
+transition: all 0.3s var(--ease-out-expo);
+margin-bottom: 4px;
+flex-shrink: 0;
+position: relative;
+z-index: calc(var(--z-base) + 20);
+transform: scale(0.8);
+}
+
+.message-wrapper:hover .side-action-btn {
+opacity: 0.4;
+transform: scale(1);
+}
+
+.side-action-btn:hover {
+opacity: 1 !important;
+color: var(--text-main);
+background-color: var(--surface);
+transform: scale(1.15) !important;
+}
+
+/* Touch devices - always show action buttons */
+@media (hover: none) and (pointer: coarse) {
+.side-action-btn {
+opacity: 0.5;
+transform: scale(1);
+}
+}
+
+/* ============================
+16. REACTIONS
+============================ */
+
+.reaction-chips-container {
+position: absolute;
+bottom: -12px;
+left: 8px;
+display: flex;
+gap: 4px;
+z-index: calc(var(--z-base) + 10);
+}
+
+.my-message .reaction-chips-container {
+left: auto;
+right: 8px;
+}
+
+.reaction-chip {
+background-color: var(--surface);
+border: 1px solid var(--border-color);
+border-radius: var(--radius-lg);
+padding: 2px 8px;
+font-size: 0.7rem;
+display: flex;
+align-items: center;
+gap: 3px;
+box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+cursor: pointer;
+color: var(--text-muted);
+transition: all 0.2s ease;
+animation: modalZoom 0.2s var(--ease-out-expo);
+}
+
+.reaction-chip:hover {
+border-color: var(--text-main);
+color: var(--text-main);
+transform: translateY(-2px);
+}
+
+.reaction-chip.user-reacted {
+background-color: var(--border-color);
+border-color: var(--text-muted);
+color: var(--text-main);
+}
+
+.reaction-picker {
+position: fixed;
+background-color: var(--surface);
+border: 1px solid var(--border-color);
+border-radius: var(--radius-lg);
+padding: 8px;
+display: flex;
+gap: 12px;
+box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.7);
+animation: modalZoom 0.2s var(--ease-out-expo);
+z-index: var(--z-tooltip);
+backdrop-filter: blur(10px);
+-webkit-backdrop-filter: blur(10px);
+}
+
+.reaction-option {
+font-size: 1.5rem;
+cursor: pointer;
+transition: transform 0.2s ease;
+user-select: none;
+font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+}
+
+.reaction-option:active {
+transform: scale(0.9);
+}
+
+.reaction-option:hover {
+transform: scale(1.2) translateY(-2px);
+}
+
+/* ============================
+17. SCROLL TO BOTTOM BUTTON
+============================ */
+
+#scrollToBottomBtn {
+position: absolute;
+bottom: 80px;
+left: 50%;
+transform: translateX(-50%);
+background-color: var(--surface);
+border: 1px solid var(--border-color);
+color: var(--text-main);
+width: 40px;
+height: 40px;
+border-radius: 50%;
+display: flex;
+align-items: center;
+justify-content: center;
+cursor: pointer;
+box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+z-index: var(--z-sticky);
+transition: all 0.3s ease;
+animation: modalZoom 0.3s var(--ease-out-expo);
+}
+
+#scrollToBottomBtn:hover {
+background-color: var(--text-main);
+color: var(--bg-color);
+transform: translateX(-50%) translateY(-5px);
+}
+
+#scrollToBottomBtn.hidden {
+display: none;
+}
+
+#newMsgCount {
+position: absolute;
+top: -8px;
+right: -8px;
+background-color: var(--text-main);
+color: var(--bg-color);
+font-size: 0.7rem;
+font-weight: 800;
+height: 20px;
+width: 20px;
+border-radius: 50%;
+display: flex;
+align-items: center;
+justify-content: center;
+box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+animation: systemPulse 1s infinite;
+}
+
+#newMsgCount.hidden {
+display: none;
+}
+
+/* ============================
+18. NAVIGATION
+============================ */
+
+.nav-item {
+cursor: pointer;
+padding: 8px 16px;
+border-bottom: 2px solid transparent;
+transition: all 0.3s ease;
+color: var(--text-muted);
+font-weight: 500;
+letter-spacing: 0.5px;
+user-select: none;
+}
+
+.nav-item.active,
+.nav-item:hover {
+color: var(--text-main);
+border-bottom-color: var(--text-main);
+}
+
+/* ============================
+19. TYPING INDICATOR
+============================ */
+
+#typingIndicator {
+height: 1.5rem;
+font-size: 0.75rem;
+color: var(--text-muted);
+opacity: 0.8;
+transition: opacity 0.3s ease;
+font-style: italic;
+animation: systemPulse 1.5s infinite ease-in-out;
+padding-left: var(--spacing-md);
+}
+
+/* ============================
+20. REPLY BAR
+============================ */
+
+#replyBar {
+background-color: var(--surface);
+border-top: 1px solid var(--border-color);
+padding: 0.75rem 1rem;
+display: none;
+justify-content: space-between;
+align-items: center;
+animation: smoothSlideUp 0.2s var(--ease-out-expo);
+}
+
+#replyBar.show {
+display: flex;
+}
+
+#replyBar .reply-info {
+flex: 1;
+font-size: 0.85rem;
+overflow: hidden;
+}
+
+#replyBar .reply-author {
+font-weight: bold;
+color: var(--text-main);
+}
+
+#replyBar .reply-text {
+opacity: 0.7;
+color: var(--text-muted);
+white-space: nowrap;
+overflow: hidden;
+text-overflow: ellipsis;
+max-width: 300px;
+}
+
+#replyBar button {
+background: none;
+border: none;
+color: var(--text-muted);
+cursor: pointer;
+padding: 0.25rem 0.5rem;
+transition: color 0.2s ease;
+}
+
+#replyBar button:hover {
+color: var(--text-main);
+}
+
+.reply-preview {
+background-color: rgba(255, 255, 255, 0.05);
+border-left: 2px solid var(--text-muted);
+padding: var(--spacing-sm);
+margin-bottom: var(--spacing-sm);
+border-radius: var(--radius-sm);
+font-size: 0.75rem;
+cursor: pointer;
+transition: background-color 0.2s ease;
+max-height: 60px;
+overflow: hidden;
+}
+
+.reply-preview:hover {
+background-color: rgba(255, 255, 255, 0.1);
+}
+
+.reply-preview .reply-author {
+font-weight: bold;
+margin-bottom: 0.25rem;
+color: var(--text-main);
+}
+
+.reply-preview .reply-text {
+white-space: nowrap;
+overflow: hidden;
+text-overflow: ellipsis;
+color: var(--text-muted);
+}
+
+/* ============================
+21. CONTEXT MENU
+============================ */
+
+#contextMenu {
+position: fixed;
+z-index: var(--z-tooltip);
+background-color: var(--surface);
+border: 1px solid var(--border-color);
+box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.8);
+border-radius: var(--radius-md);
+padding: 4px;
+min-width: 160px;
+opacity: 0;
+visibility: hidden;
+transform: scale(0.95);
+transform-origin: top left;
+transition:
+opacity 0.15s ease-out,
+visibility 0s linear 0.15s,
+transform 0.15s ease-out;
+}
+
+#contextMenu.is-open {
+opacity: 1;
+visibility: visible;
+transform: scale(1);
+transition-delay: 0s;
+}
+
+#contextMenu ul {
+list-style: none;
+margin: 0;
+padding: 0;
+}
+
+#contextMenu li {
+padding: 0.6rem 0.85rem;
+cursor: pointer;
+transition: all 0.2s ease;
+color: var(--text-main);
+border-radius: var(--radius-sm);
+font-size: 0.85rem;
+user-select: none;
+display: flex;
+align-items: center;
+gap: 8px;
+}
+
+#contextMenu li:hover {
+background-color: var(--highlight);
+padding-left: 1rem;
+}
+
+#contextMenu li.separator {
+height: 1px;
+background-color: var(--border-color);
+margin: 4px 0;
+padding: 0;
+cursor: default;
+}
+
+#contextMenu li.separator:hover {
+background-color: var(--border-color);
+padding-left: 0;
+}
+
+/* ============================
+22. SELECTION BAR
+============================ */
+
+#selectionBar {
+background-color: var(--surface);
+border-top: 1px solid var(--border-color);
+padding: 0.5rem 1rem;
+animation: smoothSlideUp 0.2s var(--ease-out-expo);
+}
+
+#selectionCount {
+color: var(--text-main);
+}
+
+#selectionCancel {
+color: var(--text-muted);
+}
+
+#selectionDelete {
+color: var(--danger);
+}
+
+/* ============================
+23. MODALS
+============================ */
+
+.modal-base {
+position: fixed;
+inset: 0;
+background-color: rgba(0, 0, 0, 0.85);
+backdrop-filter: blur(4px);
+-webkit-backdrop-filter: blur(4px);
+display: flex;
+align-items: center;
+justify-content: center;
+padding: var(--spacing-md);
+opacity: 0;
+visibility: hidden;
+transition: opacity 0.3s ease;
+z-index: var(--z-modal);
+isolation: isolate;
+}
+
+.modal-base.is-open {
+opacity: 1;
+visibility: visible;
+}
+
+.modal-content {
+transform: scale(0.95) translateY(10px);
+opacity: 0;
+transition: all 0.3s var(--ease-out-expo);
+/* NOTE: Do not force a responsive max-width here.
+Individual modals set their own sizing via Tailwind classes (e.g. max-w-sm).
+A global max-width was overriding those and causing the dialog to grow/shrink with the window. */
+max-height: 90vh;
+overflow: auto;
+}
+
+.modal-base.is-open .modal-content {
+transform: scale(1) translateY(0);
+opacity: 1;
+}
+
+/* ============================
+24. DATE SEPARATOR
+============================ */
+
+.date-separator {
+display: flex;
+justify-content: center;
+margin: 24px 0 12px 0;
+width: 100%;
+opacity: 0.9;
+user-select: none;
+}
+
+.date-separator span {
+background-color: var(--surface);
+color: var(--text-muted);
+font-size: 0.7rem;
+font-weight: 600;
+padding: 4px 12px;
+border-radius: var(--radius-full);
+border: 1px solid var(--border-color);
+}
+
+/* ============================
+25. PINNED MESSAGE BAR
+============================ */
+
+#pinnedMessageBar {
+overflow: hidden;
+}
+
+#pinnedMessageText {
+max-width: 100%;
+overflow: hidden;
+text-overflow: ellipsis;
+white-space: nowrap;
+}
+
+/* ============================
+26. INPUT FORMS
+============================ */
+
+#chatForm,
+#confessionForm {
+padding: 12px;
+/* Prevent the bottom input bar from colliding with iOS home indicator / safe area in PWA */
+padding-bottom: calc(12px + env(safe-area-inset-bottom));
+background-color: rgba(10, 10, 10, 0.95);
+border-top: 1px solid var(--border-color);
+}
+
+#chatInput,
+#confessionInput {
+height: 45px !important;
+min-height: 45px;
+max-height: 120px;
+padding: 10px 16px;
+border-radius: var(--radius-md);
+overflow: hidden;
+background-color: var(--surface);
+resize: none;
+overflow-wrap: break-word;
+word-break: break-word;
+}
+
+/* ============================
+27. UTILITY CLASSES
+============================ */
+
+.glow {
+text-shadow: none;
+}
+
+.neon-border {
+border: 1px solid var(--border-color);
+box-shadow: none;
+border-radius: var(--radius-sm);
+}
+
+.error {
+border-color: var(--danger) !important;
+animation: shake 0.5s ease-in-out;
+}
+
+.success {
+border-color: var(--success) !important;
+}
+
+.loading {
+position: relative;
+pointer-events: none;
+opacity: 0.7;
+}
+
+.loading::after {
+content: "";
+position: absolute;
+width: 16px;
+height: 16px;
+top: 50%;
+left: 50%;
+margin-left: -8px;
+margin-top: -8px;
+border: 2px solid transparent;
+border-top-color: currentColor;
+border-radius: 50%;
+animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+to {
+transform: rotate(360deg);
+}
+}
+
+/* ============================
+28. BANNED USER OVERLAY
+============================ */
+
+.banned-overlay {
+position: fixed;
+inset: 0;
+background-color: var(--bg-color);
+display: flex;
+flex-direction: column;
+align-items: center;
+justify-content: center;
+z-index: 99999;
+color: var(--danger);
+font-weight: bold;
+gap: var(--spacing-md);
+pointer-events: all;
+user-select: none;
+}
+
+/* ============================
+29. PRINT STYLES
+============================ */
+
+@media print {
+#contextMenu,
+#selectionBar,
+#replyBar,
+.modal-base,
+.kebab-btn,
+.side-action-btn,
+.reaction-picker,
+#scrollToBottomBtn,
+#chatForm,
+#confessionForm,
+#typingIndicator,
+#pinnedMessageBar {
+display: none !important;
+}
+
+body {
+background-color: white;
+color: black;
+}
+
+.message-bubble {
+background-color: #f5f5f5;
+border-color: #ddd;
+color: black;
+break-inside: avoid;
+}
+}
+
+/* ============================
+30. HIGH CONTRAST MODE
+============================ */
+
+@media (prefers-contrast: high) {
+:root {
+--border-color: #666666;
+--text-muted: #aaaaaa;
+}
+
+.message-bubble {
+border-width: 2px;
+}
+
+button,
+input,
+textarea {
+border-width: 2px;
+}
+}
+
+/* ============================
+31. DARK MODE ENFORCEMENT
+============================ */
+
+@media (prefers-color-scheme: light) {
+:root {
+color-scheme: dark;
+}
+}
+
+/* ============================
+32. CHARACTER COUNTER
+============================ */
+
+.char-counter {
+position: absolute;
+/* Positioned inside the textarea container (see index.html wrapper) */
+right: 12px;
+top: 50%;
+transform: translateY(-50%);
+font-size: 0.7rem;
+color: var(--text-muted);
+font-weight: 500;
+pointer-events: none;
+user-select: none;
+transition: color 0.2s ease;
+opacity: 0;
+}
+
+/* Show counter when input is focused or has content */
+#chatForm:focus-within .char-counter,
+#confessionForm:focus-within .char-counter,
+.char-counter.visible {
+opacity: 1;
+}
+
+/* Warning state - approaching limit */
+.char-counter.warning {
+color: var(--warning);
+}
+
+/* Danger state - near limit */
+.char-counter.danger {
+color: var(--danger);
+font-weight: 700;
+}
+
+/* At limit */
+.char-counter.limit {
+color: var(--danger);
+font-weight: 700;
+animation: systemPulse 0.5s ease-in-out infinite;
+}
+
+/* ============================
+33. BAN CHECK OVERLAY
+============================ */
+
+.ban-check-overlay {
+position: fixed;
+inset: 0;
+background-color: var(--bg-color);
+z-index: 99999;
+display: flex;
+align-items: center;
+justify-content: center;
+}
+
+.ban-check-overlay.hidden {
+display: none;
+opacity: 0;
+}
+
+.ban-check-text {
+color: var(--text-muted);
+font-size: 0.875rem;
+animation: systemPulse 2s ease-in-out infinite;
+}
+
+/* Device banned state */
+.device-banned .ban-check-overlay {
+display: flex !important;
+}
+
+.device-banned-content {
+text-align: center;
+}
+
+.device-banned-content h1 {
+font-size: 1.875rem;
+color: var(--danger);
+margin-bottom: 1rem;
+}
+
+.device-banned-content p {
+color: var(--text-muted);
+font-size: 0.875rem;
+margin-bottom: 0.5rem;
+}
+
+.device-banned-content .reason {
+color: #666;
+font-size: 0.75rem;
+}
+
+/* ============================
+35. SPAM WARNING TOAST
+============================ */
+
+@keyframes slideDown {
+from {
+opacity: 0;
+transform: translateX(-50%) translateY(-20px);
+}
+to {
+opacity: 1;
+transform: translateX(-50%) translateY(0);
+}
+}
+
+@keyframes fadeOut {
+from {
+opacity: 1;
+transform: translateX(-50%) translateY(0);
+}
+to {
+opacity: 0;
+transform: translateX(-50%) translateY(-10px);
+}
+}
+
+#spam-warning-toast {
+font-family: 'Inter', sans-serif;
+}" read all the codes and tell me where is the fault as i site is stuck on the Verifying Access screen
