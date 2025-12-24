@@ -3382,10 +3382,11 @@ function renderFeed(docs, type, snapshot, isRerender, isFirstSnapshot = false) {
   });
 
   const scrollAnchor = document.createElement("div");
-  scrollAnchor.id = "scrollAnchor";
-  scrollAnchor.style.height = "1px";
-  scrollAnchor.style.width = "100%";
-  feedContainer.appendChild(scrollAnchor);
+scrollAnchor.id = "scrollAnchor";
+scrollAnchor.style.height = "20px"; /* ← Changed from 1px to 20px */
+scrollAnchor.style.width = "100%";
+scrollAnchor.style.flexShrink = "0";
+feedContainer.appendChild(scrollAnchor);
 
   if (state.bottomObserver) {
     state.bottomObserver.disconnect();
